@@ -3,6 +3,7 @@ import { type RouteConfig, index, layout, prefix, route } from '@react-router/de
 export default [
   index('page.tsx'),
   route('/home', 'home/page.tsx'),
+
   route('/manifest.webmanifest', 'meta-files/manifest.ts'),
   route(
     '/.well-known/microsoft-identity-association',
@@ -15,6 +16,7 @@ export default [
   route('/api/mailto-handler', 'mailto-handler.ts'),
   route('/og-api/home', 'og-api/home.tsx'),
   route('/og-api/create', 'og-api/create.tsx'),
+
   layout('(full-width)/layout.tsx', [
     route('/about', '(full-width)/about.tsx'),
     route('/terms', '(full-width)/terms.tsx'),
@@ -22,10 +24,13 @@ export default [
     route('/privacy', '(full-width)/privacy.tsx'),
     route('/contributors', '(full-width)/contributors.tsx'),
   ]),
+
   route('/login', '(auth)/login/page.tsx'),
+
   // Enable this when we have a zero signup page
   // route('/zero/signup', '(auth)/zero/signup/page.tsx'),
   // route('/zero/login', '(auth)/zero/login/page.tsx'),
+
   layout('(routes)/layout.tsx', [
     route('/developer', '(routes)/developer/page.tsx'),
     route('/toast-test', '(routes)/toast-test.tsx'),
@@ -52,10 +57,11 @@ export default [
         route('/privacy', '(routes)/settings/privacy/page.tsx'),
         route('/security', '(routes)/settings/security/page.tsx'),
         route('/shortcuts', '(routes)/settings/shortcuts/page.tsx'),
-        route('/', '(routes)/settings/[...settings]/page.tsx'),
+        route('/*', '(routes)/settings/[...settings]/page.tsx'),
       ]),
     ),
   ]),
+
   // 404 page
-  route('/', 'meta-files/not-found.ts'),
+  route('/*', 'meta-files/not-found.ts'),
 ] satisfies RouteConfig;
