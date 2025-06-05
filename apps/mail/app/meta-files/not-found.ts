@@ -1,12 +1,7 @@
 export function loader() {
-  throw new Response('Not Found', { status: 404 });
+throw new Response('Not Found', { status: 404 });
 }
 
 export default function NotFound() {
-  return (
-    <div>
-      <h1>404 - Not Found</h1>
-      <p>Sorry, the page you're looking for doesn't exist.</p>
-    </div>
-  );
+return null;
 }
