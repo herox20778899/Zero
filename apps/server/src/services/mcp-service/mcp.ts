@@ -1,125 +1,50 @@
-import {
-  streamText,
-  generateObject,
-  tool,
-  type StreamTextOnFinishCallback,
-  createDataStreamResponse,
-  generateText,
-} from 'ai';
-import {
-  AiChatPrompt,
-  getCurrentDateContext,
-  GmailSearchAssistantSystemPrompt,
-} from '../lib/prompts';
+import { getCurrentDateContext, GmailSearchAssistantSystemPrompt } from '../../lib/prompts';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { type Connection, type ConnectionContext } from 'agents';
-import { createSimpleAuth, type SimpleAuth } from '../lib/auth';
-import { connectionToDriver } from '../lib/server-utils';
-import type { MailManager } from '../lib/driver/types';
-import { FOLDERS, parseHeaders } from '../lib/utils';
-import { AIChatAgent } from 'agents/ai-chat-agent';
-import { tools as authTools } from './agent/tools';
-import { processToolCalls } from './agent/utils';
-import { connection } from '../db/schema';
+import { createDriver } from '../../lib/driver';
+import { FOLDERS } from '../../lib/utils';
 import { env } from 'cloudflare:workers';
 import { openai } from '@ai-sdk/openai';
 import { McpAgent } from 'agents/mcp';
-import { groq } from '@ai-sdk/groq';
-import { eq } from 'drizzle-orm';
-import { createDb } from '../db';
+import { createDb } from '../../db';
+import { generateText } from 'ai';
 import { z } from 'zod';
 
-export class ZeroAgent extends AIChatAgent<typeof env> {
-  driver: MailManager | null = null;
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+export const getDriverFromConnectionId = async (connectionId: string) => {
+  const db = createDb(env.HYPERDRIVE.connectionString);
+  const activeConnection = await db.query.connection.findFirst({
+    where: (connection, ops) => ops.eq(connection.id, connectionId),
+    columns: {
+      providerId: true,
+      userId: true,
+      accessToken: true,
+      refreshToken: true,
+      email: true,
+    },
+  });
+
+  if (!activeConnection || !activeConnection.accessToken || !activeConnection.refreshToken) {
+    throw new Error('No connection found');
   }
 
-  private getDataStreamResponse(onFinish: StreamTextOnFinishCallback<{}>) {
-    const dataStreamResponse = createDataStreamResponse({
-      execute: async (dataStream) => {
-        const connectionId = (await this.ctx.storage.get('connectionId')) as string;
-        if (!connectionId || !this.driver) {
-          console.log('Unauthorized no driver or connectionId [1]', connectionId, this.driver);
-          await this.setupAuth();
-          if (!connectionId || !this.driver) {
-            console.log('Unauthorized no driver or connectionId', connectionId, this.driver);
-            throw new Error('Unauthorized no driver or connectionId [2]');
-          }
-        }
-        const tools = { ...authTools(this.driver, connectionId), buildGmailSearchQuery };
-        const processedMessages = await processToolCalls(
-          {
-            messages: this.messages,
-            dataStream,
-            tools,
-          },
-          {},
-        );
+  return createDriver(activeConnection.providerId, {
+    auth: {
+      userId: activeConnection.userId,
+      accessToken: activeConnection.accessToken,
+      refreshToken: activeConnection.refreshToken,
+      email: activeConnection.email,
+    },
+  });
+};
 
-        const result = streamText({
-          model: groq('meta-llama/llama-4-maverick-17b-128e-instruct'),
-          messages: processedMessages,
-          tools,
-          onFinish,
-          system: AiChatPrompt('', '', ''),
-        });
-
-        result.mergeIntoDataStream(dataStream);
-      },
-    });
-
-    return dataStreamResponse;
-  }
-
-  private async setupAuth() {
-    if (this.name) {
-      const db = createDb(env.HYPERDRIVE.connectionString);
-      const _connection = await db.query.connection.findFirst({
-        where: eq(connection.userId, this.name),
-      });
-      if (_connection) {
-        await this.ctx.storage.put('connectionId', _connection.id);
-        this.driver = connectionToDriver(_connection);
-      }
-    }
-  }
-
-  async onConnect() {
-    await this.setupAuth();
-  }
-
-  async onChatMessage(onFinish: StreamTextOnFinishCallback<{}>) {
-    return this.getDataStreamResponse(onFinish);
-  }
-}
-
-export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
-  auth: SimpleAuth;
-  server = new McpServer({
+export class ZeroMCP extends McpAgent<typeof env, {}, { connectionId: string }> {
+  public server = new McpServer({
     name: 'zero-mcp',
     version: '1.0.0',
     description: 'Zero MCP',
   });
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.auth = createSimpleAuth();
-  }
-
   async init(): Promise<void> {
-    const session = await this.auth.api.getSession({ headers: parseHeaders(this.props.cookie) });
-    if (!session) {
-      throw new Error('Unauthorized');
-    }
-    const db = createDb(env.HYPERDRIVE.connectionString);
-    const _connection = await db.query.connection.findFirst({
-      where: eq(connection.email, session.user.email),
-    });
-    if (!_connection) {
-      throw new Error('Unauthorized');
-    }
-    const driver = connectionToDriver(_connection);
+    const driver = await getDriverFromConnectionId(this.props.connectionId);
 
     this.server.tool(
       'buildGmailSearchQuery',
@@ -146,13 +71,19 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'listThreads',
       {
-        folder: z.string().default(FOLDERS.INBOX),
-        query: z.string().optional(),
-        maxResults: z.number().optional().default(5),
-        labelIds: z.array(z.string()).optional(),
-        pageToken: z.string().optional(),
+        folder: z.string().default(FOLDERS.INBOX).describe('The folder to list threads from'),
+        query: z.string().optional().describe('The query to filter threads by'),
+        maxResults: z
+          .number()
+          .optional()
+          .default(5)
+          .describe('The maximum number of threads to return'),
+        labelIds: z.array(z.string()).optional().describe('The label IDs to filter threads by'),
+        pageToken: z.string().optional().describe('The page token to use for pagination'),
       },
       async (s) => {
+        console.log('[DEBUG] listThreads', s);
+
         const result = await driver.list({
           folder: s.folder,
           query: s.query,
@@ -187,42 +118,70 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'getThread',
       {
-        threadId: z.string(),
+        threadId: z.string().describe('The ID of the thread to get'),
       },
       async (s) => {
-        const thread = await driver.get(s.threadId);
-        const response = await env.VECTORIZE.getByIds([s.threadId]);
-        if (response.length && response?.[0]?.metadata?.['content']) {
-          const content = response[0].metadata['content'] as string;
-          const shortResponse = await env.AI.run('@cf/facebook/bart-large-cnn', {
-            input_text: content,
-          });
+        console.log('[DEBUG] getThread', s);
+
+        try {
+          const thread = await driver.get(s.threadId);
+
+          const content = thread.messages.at(-1)?.body;
+
           return {
             content: [
               {
                 type: 'text',
-                text: shortResponse.summary,
+                text: `Subject:\n\n${thread.latest?.subject}\n\nBody:\n\n${content}`,
+              },
+            ],
+          };
+
+          // const response = await env.VECTORIZE.getByIds([s.threadId]);
+          // if (response.length && response?.[0]?.metadata?.['content']) {
+          //   const content = response[0].metadata['content'] as string;
+          //   const shortResponse = await env.AI.run('@cf/facebook/bart-large-cnn', {
+          //     input_text: content,
+          //   });
+          //   return {
+          //     content: [
+          //       {
+          //         type: 'text',
+          //         text: shortResponse.summary,
+          //       },
+          //     ],
+          //   };
+          // }
+          // return {
+          //   content: [
+          //     {
+          //       type: 'text',
+          //       text: `Subject: ${thread.latest?.subject}`,
+          //     },
+          //   ],
+          // };
+        } catch (error) {
+          console.error('[DEBUG] getThread error', error);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Failed to get thread',
               },
             ],
           };
         }
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Subject: ${thread.latest?.subject}`,
-            },
-          ],
-        };
       },
     );
 
     this.server.tool(
       'markThreadsRead',
       {
-        threadIds: z.array(z.string()),
+        threadIds: z.array(z.string()).describe('The IDs of the threads to mark as read'),
       },
       async (s) => {
+        console.log('[DEBUG] markThreadsRead', s);
+
         await driver.modifyLabels(s.threadIds, {
           addLabels: [],
           removeLabels: ['UNREAD'],
@@ -241,9 +200,11 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'markThreadsUnread',
       {
-        threadIds: z.array(z.string()),
+        threadIds: z.array(z.string()).describe('The IDs of the threads to mark as unread'),
       },
       async (s) => {
+        console.log('[DEBUG] markThreadsUnread', s);
+
         await driver.modifyLabels(s.threadIds, {
           addLabels: ['UNREAD'],
           removeLabels: [],
@@ -262,11 +223,13 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'modifyLabels',
       {
-        threadIds: z.array(z.string()),
-        addLabelIds: z.array(z.string()),
-        removeLabelIds: z.array(z.string()),
+        threadIds: z.array(z.string()).describe('The IDs of the threads to modify'),
+        addLabelIds: z.array(z.string()).describe('The IDs of the labels to add'),
+        removeLabelIds: z.array(z.string()).describe('The IDs of the labels to remove'),
       },
       async (s) => {
+        console.log('[DEBUG] modifyLabels', s);
+
         await driver.modifyLabels(s.threadIds, {
           addLabels: s.addLabelIds,
           removeLabels: s.removeLabelIds,
@@ -283,6 +246,8 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     );
 
     this.server.tool('getCurrentDate', async () => {
+      console.log('[DEBUG] getCurrentDate');
+
       return {
         content: [
           {
@@ -294,6 +259,8 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     });
 
     this.server.tool('getUserLabels', async () => {
+      console.log('[DEBUG] getUserLabels');
+
       const labels = await driver.getUserLabels();
       return {
         content: [
@@ -310,9 +277,11 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'getLabel',
       {
-        id: z.string(),
+        id: z.string().describe('The ID of the label to get'),
       },
       async (s) => {
+        console.log('[DEBUG] getLabel', s);
+
         const label = await driver.getLabel(s.id);
         return {
           content: [
@@ -332,11 +301,13 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'createLabel',
       {
-        name: z.string(),
-        backgroundColor: z.string().optional(),
-        textColor: z.string().optional(),
+        name: z.string().describe('The name of the label to create'),
+        backgroundColor: z.string().optional().describe('The background color of the label'),
+        textColor: z.string().optional().describe('The text color of the label'),
       },
       async (s) => {
+        console.log('[DEBUG] createLabel', s);
+
         try {
           await driver.createLabel({
             name: s.name,
@@ -372,9 +343,11 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'bulkDelete',
       {
-        threadIds: z.array(z.string()),
+        threadIds: z.array(z.string()).describe('The IDs of the threads to delete'),
       },
       async (s) => {
+        console.log('[DEBUG] bulkDelete', s);
+
         try {
           await driver.modifyLabels(s.threadIds, {
             addLabels: ['TRASH'],
@@ -404,9 +377,11 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     this.server.tool(
       'bulkArchive',
       {
-        threadIds: z.array(z.string()),
+        threadIds: z.array(z.string()).describe('The IDs of the threads to archive'),
       },
       async (s) => {
+        console.log('[DEBUG] bulkArchive', s);
+
         try {
           await driver.modifyLabels(s.threadIds, {
             addLabels: [],
@@ -434,21 +409,3 @@ export class ZeroMCP extends McpAgent<typeof env, {}, { cookie: string }> {
     );
   }
 }
-
-const buildGmailSearchQuery = tool({
-  description: 'Build a Gmail search query',
-  parameters: z.object({
-    query: z.string().describe('The search query to build, provided in natural language'),
-  }),
-  execute: async ({ query }) => {
-    const result = await generateObject({
-      model: openai('gpt-4o'),
-      system: GmailSearchAssistantSystemPrompt(),
-      prompt: query,
-      schema: z.object({
-        query: z.string(),
-      }),
-    });
-    return result.object;
-  },
-});
